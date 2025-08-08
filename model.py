@@ -7,7 +7,7 @@ from utils import get_filter_block, aplicar_filtros
 app = Flask(__name__)
 
 
-@app.route("/filter_prediction", methods=["POST"])
+@app.route("/", methods=["POST"])
 def filter_prediction():
     """
     API para filtrar los valores de prediction usando los filtros definidos en utils.py.
@@ -52,4 +52,4 @@ def filter_prediction():
         return jsonify(status="error", error=str(e)), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5400, debug=True)
+    app.run(host="0.0.0.0", port=5310, debug=True)
