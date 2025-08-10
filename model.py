@@ -2,7 +2,7 @@
 from flask import Flask, request, jsonify, send_from_directory
 import numpy as np
 import os
-from utils import get_filter_block, aplicar_filtros
+from utils import get_filter_block, aplicar_filtros, procesar_caudales
 
 app = Flask(__name__)
 
@@ -10,7 +10,7 @@ app = Flask(__name__)
 @app.route("/", methods=["POST"])
 def filter_prediction():
     """
-    API para filtrar los valores de prediction usando los filtros definidos en utils.py.
+    API para filtrar los valores de prediction y calcular caudales.
     Espera un JSON con:
       - prediction: array de valores
       - filters: configuración de filtros
@@ -26,13 +26,12 @@ def filter_prediction():
         
         if len(prediction) == 0:
             return jsonify(status="error", error="No se recibieron valores de prediction"), 400
-        
         if len(depth) == 0:
             return jsonify(status="error", error="No se recibieron valores de depth"), 400
-            
         if len(prediction) != len(depth):
             return jsonify(status="error", error="Los arrays de prediction y depth deben tener el mismo tamaño"), 400
         
+        # Aplicar filtros a la predicción
         config = get_filter_block({"filters": filters_config})
         
         if config["mode"] == "by_ranges":
@@ -40,11 +39,16 @@ def filter_prediction():
 
         filtered = aplicar_filtros(prediction, config, fs)
         
+        # Procesar caudales usando la nueva función
+        resultados_caudales = procesar_caudales(filtered, depth)
+        
+       
         response = {
             "status": "success",
             "prediction_original": prediction.tolist(),
             "prediction_filtered": filtered.tolist(),
             "depth": depth.tolist(),
+            "caudales": resultados_caudales['df_resultados_ventanas'].to_dict('records')
         }
         return jsonify(response)
 
