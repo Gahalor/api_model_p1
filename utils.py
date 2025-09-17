@@ -262,17 +262,6 @@ def clasificar_caudal(caudal):
         return 'Zona de caudal mayor'
 
 def procesar_caudales(prediction_filtered, depth):
-    """
-    Procesa los valores filtrados de predicción para calcular caudales y ventanas.
-    
-    Args:
-        prediction_filtered: array de valores de predicción filtrados
-        depth: array de profundidades correspondientes
-        
-    Returns:
-        dict con los dataframes resultantes y estadísticas
-    """
-
     df_pred = pd.DataFrame({
         'Prediction_filtrada': prediction_filtered,
         'Depth (X)': depth
@@ -281,38 +270,26 @@ def procesar_caudales(prediction_filtered, depth):
     signal = df_pred['Prediction_filtrada'].values
     depth_values = df_pred['Depth (X)'].values
     
-    # Recopilar resultados para todos los puntos
     all_aquifer_windows = []
     
-    # Detectar picos
-    all_peaks, _ = find_peaks(signal, prominence=prominence)
-    peaks = [idx for idx in all_peaks if depth_values[idx] < -15]
+    # Detectar picos (nueva prominencia y límite de profundidad)
+    all_peaks, _ = find_peaks(signal, prominence=0.45)
+    peaks = [idx for idx in all_peaks if depth_values[idx] < -5]
     
     for peak_idx in peaks:
         peak_val = signal[peak_idx]
         if peak_val >= 10:
-            target = peak_val * 0.5
+            target = peak_val * 0.8
         elif 5 <= peak_val < 10:
-            target = peak_val * 0.85
+            target = peak_val * 0.75
         elif 0 < peak_val < 5:
-            target = peak_val * 0.95
+            target = peak_val * 0.45
         else:
             continue
             
-        # Buscar cruce por la izquierda
-        left_idx = None
-        for i in range(peak_idx - 1, -1, -1):
-            if signal[i] < target:
-                left_idx = i
-                break
-                
-        # Buscar cruce por la derecha
-        right_idx = None
-        for i in range(peak_idx + 1, len(signal)):
-            if signal[i] < target:
-                right_idx = i
-                break
-                
+        left_idx = next((i for i in range(peak_idx - 1, -1, -1) if signal[i] < target), None)
+        right_idx = next((i for i in range(peak_idx + 1, len(signal)) if signal[i] < target), None)
+        
         if left_idx is None or right_idx is None:
             continue
             
@@ -324,64 +301,41 @@ def procesar_caudales(prediction_filtered, depth):
             'Peak Value': peak_val
         })
     
-    # Crear DataFrame con todos los resultados
     df_all_windows = pd.DataFrame(all_aquifer_windows)
-    
-    # Asegurar copia del dataframe original
     df_all_windows_b = df_pred.copy()
-    
-    # Asegurar columna inicializada en ceros
     df_all_windows_b['b_window'] = 0.0
     
-    # Recorrer cada ventana y asignar b en las profundidades correspondientes
     for _, row in df_all_windows.iterrows():
-        start = row['Depth Start']
-        end = row['Depth End']
-        b_val = row['b (m)']
-        lower = min(start, end)
-        upper = max(start, end)
-        mask = (
-            (df_all_windows_b['Depth (X)'] >= lower) &
-            (df_all_windows_b['Depth (X)'] <= upper)
-        )
+        start, end, b_val = row['Depth Start'], row['Depth End'], row['b (m)']
+        lower, upper = min(start, end), max(start, end)
+        mask = (df_all_windows_b['Depth (X)'] >= lower) & (df_all_windows_b['Depth (X)'] <= upper)
         df_all_windows_b.loc[mask, 'b_window'] = b_val
     
-    # Crear columnas de caudal
-    df_all_windows_b['Q_min'] = df_all_windows_b['Prediction_filtrada'] * 10 * df_all_windows_b['b_window'] * 0.015
-    df_all_windows_b['Q_mean'] = df_all_windows_b['Prediction_filtrada'] * 500.01 * df_all_windows_b['b_window'] * 0.015
-    df_all_windows_b['Q_max'] = df_all_windows_b['Prediction_filtrada'] * 1000 * df_all_windows_b['b_window'] * 0.015
+    # NUEVAS fórmulas de caudal
+    df_all_windows_b['Q_min'] = df_all_windows_b['Prediction_filtrada'] * 300 * df_all_windows_b['b_window'] * 0.015
+    df_all_windows_b['Q_max'] = df_all_windows_b['Prediction_filtrada'] * 900 * df_all_windows_b['b_window'] * 0.015
     
-    # Conversión de m³/día a L/s
-    conversion_factor = 1000 / 86400  # ≈ 0.0115741
-    
-    # Crear columnas con caudal en litros/segundo
+    conversion_factor = 1000 / 86400
     df_all_windows_b['Q_min_Lps'] = df_all_windows_b['Q_min'] * conversion_factor
-    df_all_windows_b['Q_mean_Lps'] = df_all_windows_b['Q_mean'] * conversion_factor
     df_all_windows_b['Q_max_Lps'] = df_all_windows_b['Q_max'] * conversion_factor
     
-    # Aplicar clasificación de caudales
-    df_caudal_clasificado = df_all_windows_b[['Depth (X)', 'Q_min_Lps', 'Q_mean_Lps', 'Q_max_Lps']].copy()
+    df_caudal_clasificado = df_all_windows_b[['Depth (X)', 'Q_min_Lps', 'Q_max_Lps']].copy()
     df_caudal_clasificado['Q_min_Lps_clas'] = df_caudal_clasificado['Q_min_Lps'].apply(clasificar_caudal)
-    df_caudal_clasificado['Q_mean_Lps_clas'] = df_caudal_clasificado['Q_mean_Lps'].apply(clasificar_caudal)
     df_caudal_clasificado['Q_max_Lps_clas'] = df_caudal_clasificado['Q_max_Lps'].apply(clasificar_caudal)
     
-    # Procesamiento por ventanas
-    prof_min = df_caudal_clasificado['Depth (X)'].min()
-    prof_max = df_caudal_clasificado['Depth (X)'].max()
-    
+    prof_min, prof_max = df_caudal_clasificado['Depth (X)'].min(), df_caudal_clasificado['Depth (X)'].max()
     limites_ventanas = np.arange(prof_min, prof_max + tamano_ventana_m, tamano_ventana_m)
     resultados_ventanas = []
     
     for i in range(len(limites_ventanas) - 1):
-        z_min = limites_ventanas[i]
-        z_max = limites_ventanas[i + 1]
-        
+        z_min, z_max = limites_ventanas[i], limites_ventanas[i + 1]
         ventana_df = df_all_windows_b[(df_all_windows_b['Depth (X)'] >= z_min) & (df_all_windows_b['Depth (X)'] < z_max)]
         if len(ventana_df) < min_muestras:
             continue
             
         resumen = {
             'Profundidad media (m)': (z_min + z_max) / 2,
+            'Q_min_promedio': ventana_df['Q_min_Lps'].mean(),
             'Q_max_promedio': ventana_df['Q_max_Lps'].mean(),
         }
         resultados_ventanas.append(resumen)

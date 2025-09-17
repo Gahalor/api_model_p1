@@ -37,7 +37,9 @@ def filter_prediction():
         if config["mode"] == "by_ranges":
             config["depth"] = depth
 
-        filtered = aplicar_filtros(prediction, config, fs)
+        filtered = aplicar_filtros(prediction, config, fs) * 0.7
+        min_pred = np.min(filtered)
+        filtered = filtered - min_pred + 0.02
         
         # Procesar caudales usando la nueva función
         resultados_caudales = procesar_caudales(filtered, depth)
