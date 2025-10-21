@@ -1,347 +1,285 @@
 import numpy as np
 import pandas as pd
-import pywt
-import requests
 from scipy import signal
 from scipy.signal import find_peaks
 
-# Variables
-depth_lim = -200  # Profundidad maxima para filtrar datos
-
-# Caudal
-prominence = 0.8  # Prominencia para detectar peaks
+# Parámetros
+depth_lim = -200
 tamano_ventana_m = 3
 min_muestras = 2
 
-def safe_get(data, *keys, default=None):
-    for k in keys:
-        if isinstance(data, dict) and k in data:
-            data = data[k]
-        else:
-            return default
-    return data
-
-def read_json_data(json_data):
-    """Devuelve (df_signals, metadata) compatible con JSON directo o anidado."""
-    se = (
-        safe_get(json_data, "seismoelectric", "data") or
-        safe_get(json_data, "samples", "seismoelectric", "data") or {}
-    )
-    geo = safe_get(json_data, "geolocation", default=[])
-    sr = (
-        safe_get(json_data, "seismoelectric", "sampleRate") or
-        safe_get(json_data, "samples", "seismoelectric", "sampleRate") or
-        3333
-    )
-    
-    v1 = np.array(se.get("v1", []), float) * 1e-3
-    v2 = np.array(se.get("v2", []), float) * 1e-3
-    depth = np.array(se.get("deep", []), float)
-
-    n = min(len(v1), len(v2), len(depth))
-    df = pd.DataFrame({
-        "BLUE": v1[:n],
-        "RED":  v2[:n],
-        "Depth": depth[:n],
-        "lat": [geo[0].get("latitude", 0)] * n if geo else [0] * n,
-        "lon": [geo[0].get("longitude", 0)] * n if geo else [0] * n,
-    })
-
-    metadata = {"sampling": sr, "geolocation": geo}
-    return df, metadata
-
+# ----------------- utilidades base -----------------
 def notch_filter(x, fs=3333, f0=50.0, bw=1.0, harmonics=0, use_fft=True):
-    x = np.asarray(x, dtype=float)
-    n = x.size
-    if n == 0:
-        return x
+    x = np.asarray(x, dtype=float); n = x.size
+    if n == 0: return x
     if use_fft and n >= 4:
         freqs = np.fft.rfftfreq(n, d=1.0/fs)
         X = np.fft.rfft(x)
         notch_mask = np.zeros_like(freqs, dtype=bool)
         for k in range(harmonics + 1):
-            f_c = f0 * (k + 1)
-            if f_c >= fs / 2:
-                continue
-            half_bw = bw / 2.0
-            notch_mask |= (freqs >= (f_c - half_bw)) & (freqs <= (f_c + half_bw))
+            f_c = f0*(k+1)
+            if f_c >= fs/2: continue
+            half_bw = bw/2.0
+            notch_mask |= (freqs >= (f_c-half_bw)) & (freqs <= (f_c+half_bw))
         X[notch_mask] = 0.0
         x = np.fft.irfft(X, n=n)
-        # identidad compatible con filtfilt
-        b, a = [1.0, 0.0], [1.0, 0.0]
+        b,a=[1.0,0.0],[1.0,0.0]
         padlen = None
-        if n <= 3:
-            padlen = n - 1
+        if n <= 3: padlen = n-1
         return signal.filtfilt(b, a, x, padlen=padlen)
-    # Fallback IIR
-    Q = max(1e-3, float(f0) / float(bw)) if bw > 0 else 30.0
-    w0 = np.clip(f0 / (fs / 2.0), 1e-6, 1 - 1e-6)
-    b, a = signal.iirnotch(w0, Q)
+    Q = max(1e-3, float(f0)/float(bw)) if bw>0 else 30.0
+    w0 = np.clip(f0/(fs/2.0), 1e-6, 1-1e-6)
+    b,a = signal.iirnotch(w0, Q)
     return signal.filtfilt(b, a, x)
 
 def aplicar_notch(data, fs, freq, q):
     x = np.asarray(data, dtype=float)
-    if x.size == 0:
-        return x
-
-    # De Q a ancho de banda
+    if x.size == 0: return x
     q = float(q) if q is not None else 30.0
     q = max(q, 1e-6)
-    bw = float(freq) / q  # bw = f0 / Q
-
+    bw = float(freq)/q
     try:
-        # Usa tu notch mejorado (FFT con fallback IIR)
         return notch_filter(x, fs=float(fs), f0=float(freq), bw=float(bw),
                             harmonics=0, use_fft=True)
     except Exception:
-        # Último fallback: IIR notch clásico con normalización robusta
-        nyq = 0.5 * float(fs)
-        w0 = np.clip(float(freq) / nyq, 1e-6, 1 - 1e-6)
-        b, a = signal.iirnotch(w0, q)
-        # Evita filtfilt en tramos muy cortos
-        if x.size <= 9:
-            return x
+        if x.size <= 9: return x
+        nyq = 0.5*float(fs)
+        w0 = np.clip(float(freq)/nyq, 1e-6, 1-1e-6)
+        b,a = signal.iirnotch(w0, q)
         return signal.filtfilt(b, a, x)
 
-
-
 def aplicar_un_filtro(data, filter_type, params, fs):
-    """
-    Aplica low-pass Butterworth o Chebyshev I.
-    - Misma firma/salida.
-    - Normaliza corte a [0, 1) respecto a Nyquist.
-    - Evita filtfilt en tramos demasiado cortos.
-    """
     x = np.asarray(data, dtype=float)
-    if x.size == 0:
-        return x
-
+    if x.size == 0: return x
     params = params or {}
     try:
         order  = int(params.get("order", 2))
         cutoff = float(params.get("cutoff", 50.0))
-        ripple = float(params.get("ripple", 0.1))  # solo cheby
-
-        # Evitar filtfilt cuando no hay muestras suficientes
-        padlen_min = max(3 * (order + 1), 9)
-        if x.size <= padlen_min:
-            return x
-
-        nyq = 0.5 * float(fs)
-        wn = np.clip(cutoff / nyq, 1e-6, 0.999999)
-
-        if filter_type.lower() in ("butter"):
-            b, a = signal.butter(order, wn, btype='low')
+        ripple = float(params.get("ripple", 0.1))
+        padlen_min = max(3*(order+1), 9)
+        if x.size <= padlen_min: return x
+        nyq = 0.5*float(fs)
+        wn = np.clip(cutoff/nyq, 1e-6, 0.999999)
+        if filter_type.lower() in ("butter",):
+            b,a = signal.butter(order, wn, btype='low')
             return signal.filtfilt(b, a, x)
-
-        elif filter_type.lower() in ("cheby"):
-            b, a = signal.cheby1(order, ripple, wn, btype='low')
+        elif filter_type.lower() in ("cheby",):
+            b,a = signal.cheby1(order, ripple, wn, btype='low')
             return signal.filtfilt(b, a, x)
-
-        # Tipo no reconocido → no tocar
         return x
-
     except Exception:
-        # Pase silencioso: conserva entrada ante cualquier error
         return data
 
 def aplicar_filtros(data, config, fs):
-    data = np.asarray(data)
+    data = np.asarray(data, float)
+    if config["notch"]:
+        if len(data) >= 9:
+            data = aplicar_notch(data, fs, config["notch"].get("frequency",50),
+                                 config["notch"].get("q_value",30))
+    return aplicar_un_filtro(data, config["type"], config["params"], fs)
 
-    if config["mode"] == "global":
-        if config["notch"]:
-            if len(data) >= 9:
-                data = aplicar_notch(data, fs,
-                                     config["notch"].get("frequency", 50),
-                                     config["notch"].get("q_value", 30))
-            else:
-                raise ValueError("Datos muy cortos para aplicar notch. Se omite.")
-        return aplicar_un_filtro(data, config["type"], config["params"], fs)
-
-    elif config["mode"] == "by_ranges":
-        depth = config.get("depth", None)
-        if depth is None:
-            raise ValueError("Se requiere un array de depth para modo by_ranges")
-        depth = np.asarray(depth)
-        if len(depth) != len(data):
-            raise ValueError("depth y data deben tener el mismo tamaño")
-
-        filtered = np.zeros_like(data)
-        for tramo in config.get("ranges", []):
-            mn, mx = tramo["range"]
-            mask = (depth >= mn) & (depth < mx)
-            tramo_data = data[mask]
-            if config["notch"] and len(tramo_data) >= 9:
-                tramo_data = aplicar_notch(tramo_data, fs,
-                                           config["notch"].get("frequency", 50),
-                                           config["notch"].get("q_value", 30))
-            filtered[mask] = aplicar_un_filtro(
-                tramo_data,
-                tramo.get("type", "butter"),
-                tramo.get("params", {}),
-                fs
-            )
-        return filtered
-
-    else:
-        raise ValueError(f"Modo de filtro '{config['mode']}' no soportado")
-
-def build_features_dataframe(df, meta, v1f, v2f):
-    min_len = min(len(v1f), len(v2f), len(df["Depth"]))
-    geo = meta.get("geolocation", [])
-    latitude = geo[0].get("latitude", 0) if geo else 0
-    longitude = geo[0].get("longitude", 0) if geo else 0
-    depth = df["Depth"].to_numpy()[:min_len]
-
-    out_df = pd.DataFrame({
-        "BLUE Channel (Z)": v1f[:min_len],
-        "RED Channel (Z)": v2f[:min_len],
-        "latitude": [latitude] * min_len,
-        "longitude": [longitude] * min_len,
-        "Depth (X)": depth
-    })
-
-    out_df = out_df[out_df["Depth (X)"] >= depth_lim]
-    out_df['A+B'] = (out_df['BLUE Channel (Z)'] + out_df['RED Channel (Z)']) / 2
-    out_df['A-B'] = out_df['BLUE Channel (Z)'] - out_df['RED Channel (Z)']
-    out_df['A*B'] = out_df['BLUE Channel (Z)'] * out_df['RED Channel (Z)']
-    out_df['A/B'] = np.divide(out_df['BLUE Channel (Z)'], out_df['RED Channel (Z)'],
-                              out=np.zeros_like(out_df['BLUE Channel (Z)']),
-                              where=out_df['RED Channel (Z)'] != 0)
-    out_df['AB'] = np.abs(out_df['BLUE Channel (Z)'] - out_df['RED Channel (Z)'])
-    out_df['AAB'] = out_df['BLUE Channel (Z)'] ** 2 - out_df['RED Channel (Z)'] ** 2
-    out_df['BAB'] = out_df['BLUE Channel (Z)'] ** 2 + out_df['RED Channel (Z)'] ** 2
-    out_df['RAB'] = np.sqrt(out_df['BLUE Channel (Z)'] ** 2 + out_df['RED Channel (Z)'] ** 2)
-    out_df['MBA'] = out_df['BLUE Channel (Z)'].rolling(window=2).mean()
-    out_df['MBB'] = out_df['RED Channel (Z)'].rolling(window=2).mean()
-    out_df['dA'] = out_df['BLUE Channel (Z)'].diff().bfill()
-    out_df['dB'] = out_df['RED Channel (Z)'].diff().bfill()
-    out_df['ABB'] = out_df['BLUE Channel (Z)'] + out_df['RED Channel (Z)'] ** 2
-
-    return out_df
-
-def get_filter_block(json_data, key="filters"):
-    """
-    Obtiene la configuración de filtros desde el JSON.
-    key: "filters" para voltajes o "filters_magnetometer" para magnetómetro.
-    """
-    f = json_data.get(key, {})
-    mode = f.get("mode", "global")
-    notch = f.get("notch", {"frequency": 50, "q_value": 30})
-
+def get_filter_block(json_wrap, key="filters"):
+    f = (json_wrap or {}).get(key, {}) or {}
+    mode = f.get("mode","global")
+    notch = f.get("notch", {"frequency":50, "q_value":30})
     if mode == "global":
         g = f.get("global", {})
-        return {
-            "mode": "global",
-            "notch": notch,
-            "type": g.get("type", "butter"),
-            "params": g.get("params", {})
-        }
-    elif mode == "by_ranges":
-        return {
-            "mode": "by_ranges",
-            "notch": notch,
-            "ranges": f.get("ranges", [])
-        }
+        return {"mode":"global","notch":notch,"type":g.get("type","butter"),"params":g.get("params",{})}
     else:
         raise ValueError(f"Modo de filtros '{mode}' no válido")
 
-def clasificar_caudal(caudal):
-    """Clasifica el caudal en diferentes zonas según su valor."""
-    if caudal < 0.1:
-        return 'Zona no saturada'
-    elif 0.1 <= caudal < 0.5:
-        return 'Zona de transición'
-    elif 0.5 <= caudal < 2.5:
-        return 'Zona de caudales muy pequeños'
-    elif 2.5 <= caudal < 10:
-        return 'Zona de caudal menor'
-    elif 10 <= caudal < 25:
-        return 'Zona de caudal medio'
-    else:
-        return 'Zona de caudal mayor'
+# ----------------- soporte picos manuales -----------------
+def _nearest_index_by_depth(depth_arr, dval):
+    depth_arr = np.asarray(depth_arr, float)
+    idx = int(np.argmin(np.abs(depth_arr - float(dval))))
+    return idx
 
-def procesar_caudales(prediction_filtered, depth):
-    df_pred = pd.DataFrame({
-        'Prediction_filtrada': prediction_filtered,
-        'Depth (X)': depth
-    })
-    
-    signal = df_pred['Prediction_filtrada'].values
-    depth_values = df_pred['Depth (X)'].values
-    
-    all_aquifer_windows = []
-    
-    # Detectar picos (nueva prominencia y límite de profundidad)
-    all_peaks, _ = find_peaks(signal, prominence=0.45)
-    peaks = [idx for idx in all_peaks if depth_values[idx] < -5]
-    
-    for peak_idx in peaks:
-        peak_val = signal[peak_idx]
-        if peak_val >= 10:
-            target = peak_val * 0.8
-        elif 5 <= peak_val < 10:
-            target = peak_val * 0.75
-        elif 0 < peak_val < 5:
-            target = peak_val * 0.45
+def preparar_ventanas_manuales(manual_cfg, depth, signal_vals):
+    """
+    Convierte manual_peaks -> lista de ventanas [{left_idx,right_idx,peak_idx}, ...]
+    Soporta:
+      - items: {peak}           (depth), busca left/right por cruce automático
+      - items: {left,right}     (depth), no requiere peak; peak = máximo en [left,right]
+      - items: {peak,left,right}(depth), usa tal cual
+    Retorna (ventanas_manuales, peaks_usados) o (None, None) si no hay manuales.
+    """
+    if not manual_cfg:
+        return None, None
+
+    mode = (manual_cfg.get("mode") or "depth").lower()
+    if mode != "depth":
+        raise ValueError("manual_peaks.mode debe ser 'depth'")
+
+    items = manual_cfg.get("items", [])
+    if not items:
+        raise ValueError("manual_peaks inválido: items vacío")
+
+    depth_vals = np.asarray(depth, float)
+    signal_vals = np.asarray(signal_vals, float)
+
+    ventanas = []
+    usados = []
+
+    for it in items:
+        has_peak = ("peak" in it)
+        has_left = ("left" in it)
+        has_right = ("right" in it)
+
+        peak_idx = None
+        left_idx = None
+        right_idx = None
+        peak_depth = None
+        target_fraction = None 
+
+        # Caso 1: left/right sin peak → peak = máximo dentro del tramo
+        if has_left and has_right and not has_peak:
+            left_idx  = _nearest_index_by_depth(depth_vals, it["left"])
+            right_idx = _nearest_index_by_depth(depth_vals, it["right"])
+            if left_idx > right_idx:
+                left_idx, right_idx = right_idx, left_idx
+            seg = signal_vals[left_idx:right_idx+1]
+            if seg.size == 0:
+                continue
+            rel = int(np.argmax(seg))
+            peak_idx = left_idx + rel
+            peak_depth = float(depth_vals[peak_idx])
+            target_fraction = None
+        # Caso 2: peak solo → buscar cruces de nivel automáticamente
+        elif has_peak and not (has_left and has_right):
+            peak_idx = _nearest_index_by_depth(depth_vals, it["peak"])
+            peak_depth = float(depth_vals[peak_idx])
+            peak_val = float(signal_vals[peak_idx])
+            # regla de objetivo
+            fr = manual_cfg.get("target_rule","auto")
+            if isinstance(fr,(int,float)): target_fraction = float(fr)
+            else:
+                if   peak_val >= 10: target_fraction = 0.8
+                elif peak_val >= 5:  target_fraction = 0.75
+                elif peak_val > 0:   target_fraction = 0.85
+                else:                target_fraction = 0.8
+            target = peak_val * target_fraction
+            # cruces
+            for i in range(peak_idx-1, -1, -1):
+                if signal_vals[i] < target:
+                    left_idx = i; break
+            for i in range(peak_idx+1, len(signal_vals)):
+                if signal_vals[i] < target:
+                    right_idx = i; break
+            if left_idx is None or right_idx is None:
+                continue
+        # Caso 3: peak + left + right → usar tal cual
+        elif has_peak and has_left and has_right:
+            left_idx  = _nearest_index_by_depth(depth_vals, it["left"])
+            right_idx = _nearest_index_by_depth(depth_vals, it["right"])
+            if left_idx > right_idx:
+                left_idx, right_idx = right_idx, left_idx
+            peak_idx = _nearest_index_by_depth(depth_vals, it["peak"])
+            peak_depth = float(depth_vals[peak_idx])
+            target_fraction = None
         else:
             continue
-            
-        left_idx = next((i for i in range(peak_idx - 1, -1, -1) if signal[i] < target), None)
-        right_idx = next((i for i in range(peak_idx + 1, len(signal)) if signal[i] < target), None)
-        
-        if left_idx is None or right_idx is None:
-            continue
-            
-        b = abs(depth_values[right_idx] - depth_values[left_idx])
-        all_aquifer_windows.append({
-            'Depth Start': depth_values[left_idx],
-            'Depth End': depth_values[right_idx],
-            'b (m)': b,
-            'Peak Value': peak_val
+
+        ventanas.append({
+            "left_idx":  int(left_idx),
+            "right_idx": int(right_idx),
+            "peak_idx":  int(peak_idx),
         })
-    
-    df_all_windows = pd.DataFrame(all_aquifer_windows)
+        usados.append({
+            "left_idx":  int(left_idx),
+            "peak_idx":  int(peak_idx),
+            "right_idx": int(right_idx),
+            "peak_depth": float(peak_depth) if peak_depth is not None else None,
+            "target_fraction": target_fraction
+        })
+
+    if not ventanas:
+        return [], []  
+
+    return ventanas, usados
+
+# ----------------- caudales -----------------
+def procesar_caudales(prediction_filtered, depth, ventanas_manuales=None):
+    df_pred = pd.DataFrame({
+        'Prediction_filtrada': np.asarray(prediction_filtered, float),
+        'Depth (X)': np.asarray(depth, float)
+    })
+    signal_vals = df_pred['Prediction_filtrada'].values
+    depth_vals  = df_pred['Depth (X)'].values
+
+    aquifer_windows = []
+
+    if isinstance(ventanas_manuales, list):
+        for w in ventanas_manuales:
+            li = int(w["left_idx"]); ri = int(w["right_idx"])
+            if li < 0 or ri >= len(depth_vals) or li >= ri:
+                continue
+            b = abs(depth_vals[ri] - depth_vals[li])
+            aquifer_windows.append({
+                'Depth Start': depth_vals[li],
+                'Depth End':   depth_vals[ri],
+                'b (m)':       float(b),
+                'Peak Value':  float(signal_vals[int(w["peak_idx"])])
+            })
+    else:
+        # Detección automática tradicional
+        all_peaks, _ = find_peaks(signal_vals, prominence=0.55)
+        peaks = [idx for idx in all_peaks if depth_vals[idx] < -5]
+        for peak_idx in peaks:
+            peak_val = signal_vals[peak_idx]
+            if   peak_val >= 10: target = peak_val*0.8
+            elif peak_val >= 5:  target = peak_val*0.75
+            elif peak_val > 0:   target = peak_val*0.85
+            else:                continue
+            left_idx = None; right_idx = None
+            for i in range(peak_idx-1, -1, -1):
+                if signal_vals[i] < target:
+                    left_idx = i; break
+            for i in range(peak_idx+1, len(signal_vals)):
+                if signal_vals[i] < target:
+                    right_idx = i; break
+            if left_idx is None or right_idx is None:
+                continue
+            b = abs(depth_vals[right_idx] - depth_vals[left_idx])
+            aquifer_windows.append({
+                'Depth Start': depth_vals[left_idx],
+                'Depth End':   depth_vals[right_idx],
+                'b (m)':       float(b),
+                'Peak Value':  float(peak_val)
+            })
+
+    # DataFrame de ventanas
+    df_all_windows = pd.DataFrame(aquifer_windows)
     df_all_windows_b = df_pred.copy()
     df_all_windows_b['b_window'] = 0.0
-    
+
     for _, row in df_all_windows.iterrows():
-        start, end, b_val = row['Depth Start'], row['Depth End'], row['b (m)']
-        lower, upper = min(start, end), max(start, end)
+        start = float(row['Depth Start']); end = float(row['Depth End'])
+        lower, upper = min(start,end), max(start,end)
         mask = (df_all_windows_b['Depth (X)'] >= lower) & (df_all_windows_b['Depth (X)'] <= upper)
-        df_all_windows_b.loc[mask, 'b_window'] = b_val
-    
-    # NUEVAS fórmulas de caudal
+        df_all_windows_b.loc[mask, 'b_window'] = float(row['b (m)'])
+
     df_all_windows_b['Q_min'] = df_all_windows_b['Prediction_filtrada'] * 300 * df_all_windows_b['b_window'] * 0.015
     df_all_windows_b['Q_max'] = df_all_windows_b['Prediction_filtrada'] * 900 * df_all_windows_b['b_window'] * 0.015
-    
-    conversion_factor = 1000 / 86400
-    df_all_windows_b['Q_min_Lps'] = df_all_windows_b['Q_min'] * conversion_factor
-    df_all_windows_b['Q_max_Lps'] = df_all_windows_b['Q_max'] * conversion_factor
-    
-    df_caudal_clasificado = df_all_windows_b[['Depth (X)', 'Q_min_Lps', 'Q_max_Lps']].copy()
-    df_caudal_clasificado['Q_min_Lps_clas'] = df_caudal_clasificado['Q_min_Lps'].apply(clasificar_caudal)
-    df_caudal_clasificado['Q_max_Lps_clas'] = df_caudal_clasificado['Q_max_Lps'].apply(clasificar_caudal)
-    
-    prof_min, prof_max = df_caudal_clasificado['Depth (X)'].min(), df_caudal_clasificado['Depth (X)'].max()
-    limites_ventanas = np.arange(prof_min, prof_max + tamano_ventana_m, tamano_ventana_m)
+
+    conv = 1000/86400.0
+    df_all_windows_b['Q_min_Lps'] = df_all_windows_b['Q_min'] * conv
+    df_all_windows_b['Q_max_Lps'] = df_all_windows_b['Q_max'] * conv
+
+    prof_min = float(df_all_windows_b['Depth (X)'].min())
+    prof_max = float(df_all_windows_b['Depth (X)'].max())
+    limites = np.arange(prof_min, prof_max + tamano_ventana_m, tamano_ventana_m)
+
     resultados_ventanas = []
-    
-    for i in range(len(limites_ventanas) - 1):
-        z_min, z_max = limites_ventanas[i], limites_ventanas[i + 1]
+    for i in range(len(limites)-1):
+        z_min = limites[i]; z_max = limites[i+1]
         ventana_df = df_all_windows_b[(df_all_windows_b['Depth (X)'] >= z_min) & (df_all_windows_b['Depth (X)'] < z_max)]
         if len(ventana_df) < min_muestras:
             continue
-            
-        resumen = {
-            'Profundidad media (m)': (z_min + z_max) / 2,
-            'Q_min_promedio': ventana_df['Q_min_Lps'].mean(),
-            'Q_max_promedio': ventana_df['Q_max_Lps'].mean(),
-        }
-        resultados_ventanas.append(resumen)
-    
+        resultados_ventanas.append({
+            'Profundidad media (m)': float((z_min+z_max)/2.0),
+            'Q_min_promedio': float(ventana_df['Q_min_Lps'].mean()),
+            'Q_max_promedio': float(ventana_df['Q_max_Lps'].mean()),
+        })
+
     df_resultados_ventanas = pd.DataFrame(resultados_ventanas)
-    
-    return {
-        'df_resultados_ventanas': df_resultados_ventanas
-    }
+    return {'df_resultados_ventanas': df_resultados_ventanas}
