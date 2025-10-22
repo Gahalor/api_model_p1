@@ -80,13 +80,21 @@ def aplicar_filtros(data, config, fs):
 
 def get_filter_block(json_wrap, key="filters"):
     f = (json_wrap or {}).get(key, {}) or {}
-    mode = f.get("mode","global")
-    notch = f.get("notch", {"frequency":50, "q_value":30})
-    if mode == "global":
+    mode = f.get("mode", "global")
+    notch = f.get("notch", {"frequency": 50, "q_value": 30})
+
+    # ✅ Acepta tanto 'global' como 'by_ranges'
+    if mode in ("global", "by_ranges"):
         g = f.get("global", {})
-        return {"mode":"global","notch":notch,"type":g.get("type","butter"),"params":g.get("params",{})}
-    else:
-        raise ValueError(f"Modo de filtros '{mode}' no válido")
+        return {
+            "mode": mode,
+            "notch": notch,
+            "type": g.get("type", "butter"),
+            "params": g.get("params", {}),
+        }
+
+    # 🔴 Cualquier otro modo sigue siendo inválido
+    raise ValueError(f"Modo de filtros '{mode}' no válido")
 
 # ----------------- soporte picos manuales -----------------
 def _nearest_index_by_depth(depth_arr, dval):
