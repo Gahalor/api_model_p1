@@ -1,5 +1,7 @@
 from flask import Flask, request, jsonify
+from functools import wraps
 import numpy as np
+import os
 from utils import (
     get_filter_block, aplicar_filtros, procesar_caudales,
     preparar_ventanas_manuales
@@ -7,7 +9,22 @@ from utils import (
 
 app = Flask(__name__)
 
+
+def require_internal_key(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        expected = os.environ.get("INTERNAL_API_KEY", "")
+        if not expected:
+            return jsonify({"status": "error", "message": "API no configurada."}), 500
+        provided = request.headers.get("X-Internal-Key", "")
+        if not provided or provided != expected:
+            return jsonify({"status": "error", "message": "No autorizado."}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
 @app.route("/", methods=["POST"])
+@require_internal_key
 def filter_prediction():
     try:
         data = request.get_json(force=True)
