@@ -96,7 +96,7 @@ def get_filter_block(json_wrap, key="filters"):
     # 🔴 Cualquier otro modo sigue siendo inválido
     raise ValueError(f"Modo de filtros '{mode}' no válido")
 
-# ----------------- soporte picos manuales -----------------
+# ----------------- soporte peaks manuales -----------------
 def _nearest_index_by_depth(depth_arr, dval):
     depth_arr = np.asarray(depth_arr, float)
     idx = int(np.argmin(np.abs(depth_arr - float(dval))))
@@ -104,15 +104,18 @@ def _nearest_index_by_depth(depth_arr, dval):
 
 def preparar_ventanas_manuales(manual_cfg, depth, signal_vals):
     """
-    Convierte manual_peaks -> lista de ventanas [{left_idx,right_idx,peak_idx}, ...]
+    Convierte
+      manual_peaks -> lista de ventanas [{left_idx,right_idx,peak_idx}, ...]
     Soporta:
-      - items: {peak}           (depth), busca left/right por cruce automático
-      - items: {left,right}     (depth), no requiere peak; peak = máximo en [left,right]
-      - items: {peak,left,right}(depth), usa tal cual
+      - items: {id, peak}              (depth), busca left/right por cruce automático
+      - items: {id, left, right}       (depth), left/right definen el ancho del acuífero
+      - items: {id, peak, left, right} (depth), left/right definen el ancho y peak es referencia
+    El id es opcional; si falta se genera manual_1, manual_2, etc.
     Retorna (ventanas_manuales, peaks_usados) o (None, None) si no hay manuales.
     """
     if not manual_cfg:
         return None, None
+
 
     mode = (manual_cfg.get("mode") or "depth").lower()
     if mode != "depth":
@@ -128,7 +131,8 @@ def preparar_ventanas_manuales(manual_cfg, depth, signal_vals):
     ventanas = []
     usados = []
 
-    for it in items:
+    for pos, it in enumerate(items, start=1):
+        peak_id = it.get("id") or it.get("peak_id") or f"manual_{pos}"
         has_peak = ("peak" in it)
         has_left = ("left" in it)
         has_right = ("right" in it)
@@ -137,26 +141,31 @@ def preparar_ventanas_manuales(manual_cfg, depth, signal_vals):
         left_idx = None
         right_idx = None
         peak_depth = None
-        target_fraction = None 
+        peak_value = None
+        target_fraction = None
 
-        # Caso 1: left/right sin peak → peak = máximo dentro del tramo
-        if has_left and has_right and not has_peak:
+        # Caso 1: left/right manuales → definen directamente el ancho del acuífero.
+        if has_left and has_right:
             left_idx  = _nearest_index_by_depth(depth_vals, it["left"])
             right_idx = _nearest_index_by_depth(depth_vals, it["right"])
             if left_idx > right_idx:
                 left_idx, right_idx = right_idx, left_idx
-            seg = signal_vals[left_idx:right_idx+1]
-            if seg.size == 0:
+            if left_idx == right_idx:
                 continue
-            rel = int(np.argmax(seg))
-            peak_idx = left_idx + rel
-            peak_depth = float(depth_vals[peak_idx])
+
+            if has_peak:
+                peak_idx = _nearest_index_by_depth(depth_vals, it["peak"])
+                peak_depth = float(depth_vals[peak_idx])
+                peak_value = float(signal_vals[peak_idx])
+
             target_fraction = None
+
         # Caso 2: peak solo → buscar cruces de nivel automáticamente
-        elif has_peak and not (has_left and has_right):
+        elif has_peak:
             peak_idx = _nearest_index_by_depth(depth_vals, it["peak"])
             peak_depth = float(depth_vals[peak_idx])
             peak_val = float(signal_vals[peak_idx])
+            peak_value = peak_val
             # regla de objetivo
             fr = manual_cfg.get("target_rule","auto")
             if isinstance(fr,(int,float)): target_fraction = float(fr)
@@ -188,16 +197,22 @@ def preparar_ventanas_manuales(manual_cfg, depth, signal_vals):
             continue
 
         ventanas.append({
+            "id": str(peak_id),
             "left_idx":  int(left_idx),
             "right_idx": int(right_idx),
-            "peak_idx":  int(peak_idx),
+            "peak_idx":  int(peak_idx) if peak_idx is not None else None,
         })
         usados.append({
-            "left_idx":  int(left_idx),
-            "peak_idx":  int(peak_idx),
-            "right_idx": int(right_idx),
+            "id": str(peak_id),
+            "left_idx": int(left_idx),
+            "left_depth": float(depth_vals[left_idx]),
+            "peak_idx": int(peak_idx) if peak_idx is not None else None,
             "peak_depth": float(peak_depth) if peak_depth is not None else None,
-            "target_fraction": target_fraction
+            "peak_value": float(peak_value) if peak_value is not None else None,
+            "right_idx": int(right_idx),
+            "right_depth": float(depth_vals[right_idx]),
+            "b_m": float(abs(depth_vals[right_idx] - depth_vals[left_idx])),
+            "target_fraction": target_fraction,
         })
 
     if not ventanas:
@@ -221,12 +236,18 @@ def procesar_caudales(prediction_filtered, depth, ventanas_manuales=None):
             li = int(w["left_idx"]); ri = int(w["right_idx"])
             if li < 0 or ri >= len(depth_vals) or li >= ri:
                 continue
+            peak_idx = w.get("peak_idx")
+            peak_value = None
+            if peak_idx is not None:
+                peak_idx = int(peak_idx)
+                if 0 <= peak_idx < len(signal_vals):
+                    peak_value = float(signal_vals[peak_idx])
             b = abs(depth_vals[ri] - depth_vals[li])
             aquifer_windows.append({
                 'Depth Start': depth_vals[li],
                 'Depth End':   depth_vals[ri],
                 'b (m)':       float(b),
-                'Peak Value':  float(signal_vals[int(w["peak_idx"])])
+                'Peak Value':  peak_value
             })
     else:
         # Detección automática tradicional
